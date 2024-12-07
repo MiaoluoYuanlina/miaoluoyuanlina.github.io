@@ -1,1 +1,1 @@
-https://github.com/MiaoluoYuanlina/AliceinCradle_BepInEx_XiaoMiaoICa-Mod/releases/download/1.2/AliceInCradle_Miaoo_Mod_1.2.dll
+https://github.com/MiaoluoYuanlina/AliceinCradle_BepInEx_XiaoMiaoICa-Mod/releases/download/Mod/AliceInCradle_Miaoo_Mod_1.2.dll
