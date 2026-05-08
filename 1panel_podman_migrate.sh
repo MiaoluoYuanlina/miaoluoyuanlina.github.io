@@ -1,131 +1,108 @@
 #!/bin/bash
 
-# ==============================================================================
-# 1Panel 环境下 Docker 完美迁移至 Podman 脚本 (Debian 13 - 终极安全守护版)
-# 新增特性：严格的 Docker 状态检查，遇到任何异常立即终止，防止破坏系统
-# ==============================================================================
-
+# 颜色定义
+RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-RED='\033[0;31m'
 NC='\033[0m'
 
-echo -e "${GREEN}==================================================${NC}"
-echo -e "${GREEN}  开始 1Panel 完美迁移：Docker -> Podman (安全版)${NC}"
-echo -e "${GREEN}==================================================${NC}"
+# 错误处理函数：遇到错误暂停并等待人工干预
+pause_on_error() {
+    if [ $? -ne 0 ]; then
+        echo -e "\n${RED}[ERROR] 脚本在执行上一条命令时出错。${NC}"
+        echo -e "${YELLOW}请检查错误信息。修复后按 [Enter] 继续，或按 [Ctrl+C] 退出。${NC}"
+        read
+    fi
+}
+
+echo -e "${YELLOW}>>> 准备从 Podman 迁移到 Docker (Debian 13 / 1Panel 专用) <<<${NC}"
 
 # 1. 权限检查
 if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}错误：请使用 root 权限 (sudo) 运行此脚本！${NC}"
+  echo -e "${RED}请以 root 权限运行此脚本 (sudo -i)${NC}"
   exit 1
 fi
 
-# 2. 严格检查 Docker 状态 (安全守卫)
-echo -e "\n${YELLOW}[1/7] 正在检查 Docker 运行环境...${NC}"
+# 2. 导出 Podman 镜像
+echo -e "${GREEN}[1/7] 正在备份 Podman 镜像...${NC}"
+BACKUP_DIR="/tmp/podman_migration_$(date +%s)"
+mkdir -p "$BACKUP_DIR"
+# 获取镜像列表，排除中间层镜像
+IMAGE_LIST=$(podman images --format "{{.Repository}}:{{.Tag}}" | grep -v "<none>")
 
-# 检查 Docker 命令是否存在
-if ! command -v docker &> /dev/null; then
-    echo -e "${RED}[严重错误] 未检测到 docker 命令！${NC}"
-    echo -e "${RED}Docker 可能已被卸载，无法提取现有镜像。${NC}"
-    echo -e "${RED}系统未做任何修改，脚本已安全终止。${NC}"
-    exit 1
-fi
-
-# 检查 Docker 服务是否在运行，如果没运行则尝试启动它
-if ! systemctl is-active --quiet docker; then
-    echo -e "${YELLOW}检测到 Docker 服务未运行，正在尝试启动它以便导出镜像...${NC}"
-    systemctl start docker || true
-    sleep 3
-fi
-
-# 再次确认 Docker 是否成功运行
-if ! systemctl is-active --quiet docker; then
-    echo -e "${RED}[严重错误] Docker 服务无法启动！${NC}"
-    echo -e "${RED}必须在 Docker 正常运行的状态下，才能无损提取现有镜像。${NC}"
-    echo -e "${RED}请先修复 Docker。系统未做任何修改，脚本已安全终止。${NC}"
-    exit 1
-fi
-
-echo -e "${GREEN} -> Docker 运行正常，环境检查通过！${NC}"
-
-# 3. 安装 Podman 及依赖
-echo -e "\n${YELLOW}[2/7] 正在安装 Podman 引擎...${NC}"
-apt update
-apt install -y podman uidmap podman-docker
-
-# 4. 完美迁移 Docker 镜像到 Podman
-echo -e "\n${YELLOW}[3/7] 正在无损迁移 Docker 镜像到 Podman (这可能需要几分钟)...${NC}"
-docker images --format "{{.Repository}}:{{.Tag}}" | grep -v "<none>" | while read -r img; do
-    echo "  - 正在导出并迁移镜像: $img"
-    # 如果某一个镜像迁移失败，打印警告但不中断整个流程
-    docker save "$img" | podman load || echo -e "${RED}  -> 镜像 $img 迁移失败，请事后检查。${NC}"
-done
-
-# 5. 剥离 Docker 守护进程 (保留数据和命令)
-echo -e "\n${YELLOW}[4/7] 正在剥离 Docker 守护进程 (安全保留数据目录)...${NC}"
-systemctl stop docker docker.socket || true
-# 仅卸载后台引擎，保留 docker-ce-cli 和 docker-compose-plugin 供 1Panel 使用
-apt-get remove -y docker-ce docker-ce-rootless-extras containerd.io docker.io
-
-# 6. 配置 Podman API 与重启持久化
-echo -e "\n${YELLOW}[5/7] 正在配置 Podman API 及重启持久化...${NC}"
-systemctl enable --now podman.socket
-
-# 解决重启后 socket 丢失的问题 (写入 systemd-tmpfiles)
-echo "L+ /var/run/docker.sock - - - - /run/podman/podman.sock" > /etc/tmpfiles.d/podman-docker.conf
-systemd-tmpfiles --create /etc/tmpfiles.d/podman-docker.conf
-
-# 激活 Podman 的容器开机自启服务 (替代 Docker 的 restart: always)
-systemctl enable podman-restart.service
-
-# 验证伪装
-sleep 2
-if curl -s --unix-socket /var/run/docker.sock http://localhost/_ping | grep -q "OK"; then
-    echo -e "${GREEN}  -> API 伪装成功！且已配置开机持久化。${NC}"
+if [ -z "$IMAGE_LIST" ]; then
+    echo "未发现需要迁移的镜像。"
 else
-    echo -e "${RED}  -> [警告] API 伪装异常，请事后检查 podman.socket 状态。${NC}"
-fi
-
-# 7. 重建网络并唤醒 1Panel 应用
-echo -e "\n${YELLOW}[6/7] 正在重建网络并唤醒 1Panel 应用...${NC}"
-podman network create 1panel-network 2>/dev/null || true
-
-APPS_DIR="/opt/1panel/apps"
-if [ -d "$APPS_DIR" ]; then
-    # 第一轮：启动所有依赖服务 (如 MySQL, Redis 等基础环境)
-    echo -e "  -> [阶段一] 正在启动基础依赖服务..."
-    find "$APPS_DIR" -maxdepth 2 -name "docker-compose.yml" | while read -r compose_file; do
-        app_dir=$(dirname "$compose_file")
-        cd "$app_dir" || continue
-        docker compose up -d 2>/dev/null
+    for img in $IMAGE_LIST; do
+        safe_name=$(echo $img | tr ':/' '_')
+        echo "导出中: $img"
+        podman save -o "$BACKUP_DIR/${safe_name}.tar" "$img"
+        pause_on_error
     done
-    
-    # 第二轮：再次启动所有服务 (确保像 Halo 这种依赖数据库的应用能成功连上)
-    echo -e "  -> [阶段二] 正在校验并拉起所有上层应用..."
-    sleep 5
-    find "$APPS_DIR" -maxdepth 2 -name "docker-compose.yml" | while read -r compose_file; do
-        app_dir=$(dirname "$compose_file")
-        app_name=$(basename "$app_dir")
-        echo -e "  - 正在确认应用状态: ${GREEN}$app_name${NC}"
-        cd "$app_dir" || continue
-        docker compose up -d
+fi
+
+# 3. 停止并清理 Podman
+echo -e "${GREEN}[2/7] 停止 Podman 容器并清理环境...${NC}"
+podman stop -a >/dev/null 2>&1
+podman rm -a >/dev/null 2>&1
+# 停止 podman.socket 防止占用
+systemctl stop podman.socket podman.service 2>/dev/null
+pause_on_error
+
+# 4. 卸载 Podman 相关包
+echo -e "${GREEN}[3/7] 卸载 Podman 软件包...${NC}"
+apt-get remove -y podman buildah skopeo python3-podman
+apt-get autoremove -y
+pause_on_error
+
+# 5. 安装 Docker Engine (处理 Debian 13 兼容性)
+echo -e "${GREEN}[4/7] 配置 Docker 官方源...${NC}"
+apt-get update
+apt-get install -y ca-certificates curl gnupg
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg --yes
+chmod a+r /etc/apt/keyrings/docker.gpg
+
+# 由于 Debian 13 较新，如果 trixie 源不存在，则回退使用 bookworm 源
+VERSION_CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+[ "$VERSION_CODENAME" == "trixie" ] && REPO_CODENAME="bookworm" || REPO_CODENAME=$VERSION_CODENAME
+
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $REPO_CODENAME stable" | \
+  tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+echo -e "${GREEN}[5/7] 安装 Docker 核心组件...${NC}"
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+pause_on_error
+
+systemctl enable --now docker
+echo -e "${GREEN}Docker 服务已启动${NC}"
+
+# 6. 导入镜像到 Docker
+echo -e "${GREEN}[6/7] 正在将镜像导入 Docker...${NC}"
+if [ -d "$BACKUP_DIR" ]; then
+    for tar_file in "$BACKUP_DIR"/*.tar; do
+        if [ -f "$tar_file" ]; then
+            echo "导入中: $tar_file"
+            docker load -i "$tar_file"
+            pause_on_error
+        fi
     done
-else
-    echo -e "${RED}未找到 1Panel 应用目录 ($APPS_DIR)。${NC}"
 fi
 
-# 8. 重启 1Panel
-echo -e "\n${YELLOW}[7/7] 正在重启 1Panel 面板服务...${NC}"
-if command -v 1pctl &> /dev/null; then
-    1pctl restart
-else
-    systemctl restart 1panel
-fi
+# 7. 清理临时文件
+rm -rf "$BACKUP_DIR"
 
-systemctl daemon-reload
-
-echo -e "\n${GREEN}==================================================${NC}"
-echo -e "${GREEN}  🎉 迁移完美完成！${NC}"
-echo -e "  1. 你的所有数据 (Halo, Maddy 等) 已无损恢复。"
-echo -e "  2. 即使重启服务器，1Panel 也能自动连接 Podman。"
-echo -e "${GREEN}==================================================${NC}"
+# 8. 1Panel 适配指导
+echo -e "\n${YELLOW}==================================================${NC}"
+echo -e "${GREEN}迁移完成！请执行以下操作适配 1Panel：${NC}"
+echo -e "${YELLOW}1. 检查 Socket：${NC} 确保 /var/run/docker.sock 存在"
+echo -e "   命令: ls -l /var/run/docker.sock"
+echo -e "${YELLOW}2. 修改 1Panel 面板设置：${NC}"
+echo -e "   登录 1Panel -> [容器] -> [设置] -> [基础设置]"
+echo -e "   确认端点地址为: ${NC}unix:///var/run/docker.sock"
+echo -e "${YELLOW}3. 重建容器：${NC}"
+echo -e "   在 1Panel [容器] 列表中，由于 Podman 容器已消失，"
+echo -e "   你需要点击“创建容器”，选择刚才导入的镜像，"
+echo -e "   并挂载原有的数据目录（通常在 /opt/1panel/apps/...）。"
+echo -e "${YELLOW}==================================================${NC}"
